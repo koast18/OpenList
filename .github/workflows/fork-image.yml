@@ -92,15 +92,15 @@ jobs:
             go.sum
           if-no-files-found: warn
 
-      - name: Vet wopan driver
+      - name: Vet and test touched drivers
         run: |
           set -euo pipefail
-          go vet ./drivers/wopan/
-          go test ./drivers/wopan/ -v 2>&1 | tail -60
+          go vet ./drivers/wopan/ ./drivers/aliyundrive_open/
+          go test ./drivers/wopan/ ./drivers/aliyundrive_open/ -v 2>&1 | tail -60
           # `go test | tail` hides the exit status behind the pipeline, so the
           # result is asserted explicitly: without this a failing test turned the
           # whole job green.
-          go test ./drivers/wopan/
+          go test ./drivers/wopan/ ./drivers/aliyundrive_open/
 
       - name: Build binary
         env:

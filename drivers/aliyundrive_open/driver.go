@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/cron"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
@@ -26,7 +27,21 @@ type AliyundriveOpen struct {
 	limiter  *limiter
 	ref      *AliyundriveOpen
 	callback *callbackRegistration
+
+	// cron keeps the refresh_token alive. Aliyun's refresh_token expires 90 days
+	// after it was last used, and without a timer the only things that ever
+	// exchange it are Init (on restart) and a failing request — so an instance
+	// that runs untouched for 90 days loses the login permanently.
+	cron *cron.Cron
+	// refreshFn is the body of the periodic refresh; tests replace it because the
+	// real one needs the network and the database.
+	refreshFn func(context.Context) error
 }
+
+// tokenRefreshInterval is how often the refresh token is exchanged in the
+// background. The token lives 90 days from its last use, so a weekly touch has a
+// very wide margin while costing one request per week.
+const tokenRefreshInterval = 7 * 24 * time.Hour
 
 func (d *AliyundriveOpen) Config() driver.Config {
 	return config
@@ -56,7 +71,49 @@ func (d *AliyundriveOpen) Init(ctx context.Context) error {
 	d.limiter.free()
 	d.limiter = getLimiterForUser(userid) // Allocate a corresponding limiter for each user.
 	d.callback = registerCallbackLimiter(userid, d.CallbackConcurrency)
+	d.startTokenRefresh()
 	return nil
+}
+
+// startTokenRefresh keeps the refresh token alive on a timer.
+//
+// Only the storage that owns the credentials does this: a driver created through
+// InitReference (a Crypt mount pointing at this one) delegates every token
+// operation to its parent, so starting a timer there would just double the
+// exchange on somebody else's account.
+func (d *AliyundriveOpen) startTokenRefresh() {
+	if d.ref != nil {
+		return
+	}
+	if d.cron != nil {
+		d.cron.Stop()
+	}
+	d.cron = cron.NewCron(tokenRefreshInterval)
+	d.cron.Do(func() {
+		if err := d.refreshForCron(); err != nil {
+			log.Errorf("[ali_open] periodic token refresh failed: %v", err)
+		}
+	})
+	log.Infof("[ali_open] periodic token refresh every %s", tokenRefreshInterval)
+}
+
+// refreshForCron is what the ticker runs. It goes through refreshFn when a test
+// installed one, and otherwise performs a real exchange.
+func (d *AliyundriveOpen) refreshForCron() error {
+	if d.refreshFn != nil {
+		return d.refreshFn(context.Background())
+	}
+	// A detached context: the driver outlives any single request, and the
+	// callback must not be cancelled when the request that happened to create the
+	// storage finishes.
+	return d.refreshToken(context.Background())
+}
+
+func (d *AliyundriveOpen) stopTokenRefresh() {
+	if d.cron != nil {
+		d.cron.Stop()
+		d.cron = nil
+	}
 }
 
 func (d *AliyundriveOpen) InitReference(storage driver.Driver) error {
@@ -69,6 +126,7 @@ func (d *AliyundriveOpen) InitReference(storage driver.Driver) error {
 }
 
 func (d *AliyundriveOpen) Drop(ctx context.Context) error {
+	d.stopTokenRefresh()
 	if d.callback != nil {
 		d.callback.unregister()
 		d.callback = nil
