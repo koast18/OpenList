@@ -1,0 +1,107 @@
+name: Build fork image (wopan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag suffix (e.g. wopan-1)'
+        required: false
+        default: 'wopan'
+  push:
+    branches:
+      - main
+    paths:
+      - 'drivers/wopan/**'
+      - 'internal/stream/limit.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/fork-image.yml'
+      - 'Dockerfile.fork'
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/openlist-wopan
+  FRONTEND_VERSION: v4.2.10
+  FRONTEND_REPO: OpenListTeam/OpenList-Frontend
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build binary and image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fetch frontend dist
+        run: |
+          set -euo pipefail
+          url="https://github.com/${FRONTEND_REPO}/releases/download/${FRONTEND_VERSION}/openlist-frontend-dist-${FRONTEND_VERSION}.tar.gz"
+          echo "downloading ${url}"
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 5 -o /tmp/dist.tar.gz "$url"; then break; fi
+            echo "attempt ${attempt} failed, retrying"
+            sleep 10
+          done
+          test -s /tmp/dist.tar.gz
+          rm -rf public/dist && mkdir -p public/dist
+          tar -xzf /tmp/dist.tar.gz -C public/dist
+          test -f public/dist/index.html
+          echo "frontend files: $(find public/dist -type f | wc -l)"
+
+      - name: Vet wopan driver
+        run: |
+          go vet ./drivers/wopan/
+          go test ./drivers/wopan/ -v 2>&1 | tail -40
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_SHA::7}"
+          ldflags="-X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${version}' \
+                   -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${FRONTEND_VERSION}' \
+                   -w -s"
+          go build -trimpath -tags=jsoniter -ldflags="$ldflags" -o build/openlist .
+          ls -lh build/openlist
+          file build/openlist
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fork
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag || 'wopan' }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

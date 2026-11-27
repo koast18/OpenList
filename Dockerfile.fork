@@ -1,0 +1,26 @@
+# Fork image: the binary is built in the workflow and copied into the official
+# base image, so the run layout (entrypoint, services, user) stays identical to
+# openlistteam/openlist. Only drivers/wopan and internal/stream differ.
+FROM openlistteam/openlist-base-image:base
+
+LABEL MAINTAINER="OpenList (wopan fork)"
+ARG USER=openlist
+ARG UID=1001
+ARG GID=1001
+
+WORKDIR /opt/openlist/
+
+RUN addgroup -g ${GID} ${USER} && \
+    adduser -D -u ${UID} -G ${USER} ${USER} && \
+    mkdir -p /opt/openlist/data
+
+COPY --chmod=755 --chown=${UID}:${GID} /build/openlist ./openlist
+COPY --chmod=755 --chown=${UID}:${GID} entrypoint.sh /entrypoint.sh
+
+USER ${USER}
+RUN /entrypoint.sh version
+
+ENV UMASK=022 RUN_ARIA2=false
+VOLUME /opt/openlist/data/
+EXPOSE 5244 5245
+CMD [ "/entrypoint.sh" ]
