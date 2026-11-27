@@ -96,14 +96,21 @@ func (d *Wopan) usesBuiltinLogin() bool {
 // of saving turned a broken login into a stream of text messages. The frontend
 // snippet in wopan_form.js calls this on an explicit click only.
 func (d *Wopan) SendSmsCode(ctx context.Context) error {
-	client := wopansdk.DefaultWithRefreshToken(d.RefreshToken)
-	client.SetAccessToken(d.AccessToken)
-	client.SetPhone(d.Phone)
-	client.SetClientCredentials(d.resolveCredentials())
-	// Same reason as in initClient: without the browser UA the edge answers 403.
-	client.SetUserAgent(wopansdk.DefaultUA)
 	if d.Phone == "" {
 		return errors.New("请先填写手机号（phone）")
+	}
+	// Reuse the client Init built when there is one (it carries the configured
+	// transport, UA and credentials); otherwise build a throwaway one, which is
+	// the case for the admin endpoint — it instantiates a fresh driver from the
+	// stored addition just to send the code.
+	client := d.client
+	if client == nil {
+		client = wopansdk.DefaultWithRefreshToken(d.RefreshToken)
+		client.SetAccessToken(d.AccessToken)
+		client.SetPhone(d.Phone)
+		client.SetClientCredentials(d.resolveCredentials())
+		// Same reason as in initClient: without the browser UA the edge answers 403.
+		client.SetUserAgent(wopansdk.DefaultUA)
 	}
 	if err := client.SendMessageCode(d.Phone, 1, "app_send", func(req *resty.Request) {
 		req.SetContext(ctx)
