@@ -100,6 +100,8 @@ func (d *Wopan) SendSmsCode(ctx context.Context) error {
 	client.SetAccessToken(d.AccessToken)
 	client.SetPhone(d.Phone)
 	client.SetClientCredentials(d.resolveCredentials())
+	// Same reason as in initClient: without the browser UA the edge answers 403.
+	client.SetUserAgent(wopansdk.DefaultUA)
 	if d.Phone == "" {
 		return errors.New("请先填写手机号（phone）")
 	}
