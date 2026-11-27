@@ -1,4 +1,4 @@
-package template
+package wopandriver
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
-	"github.com/OpenListTeam/wopan-sdk-go"
+	wopansdk "github.com/OpenListTeam/wopan-sdk-go"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -19,11 +19,19 @@ import (
 // shorter than that can never be used and must be refreshed first.
 const minAccessTokenLen = 16
 
+// upload2CRetryTimes is how many times a single part is retried by the SDK.
+// Without it a single flaky 8 MiB part fails the whole upload.
+const upload2CRetryTimes = 3
+
 type Wopan struct {
 	model.Storage
 	Addition
-	client          *wopan.WoClient
+	client          *wopansdk.WoClient
 	defaultFamilyID string
+	vipLevel        string
+	// clientMarkResolved is the client identity that actually worked, so the
+	// auto-detection only costs one extra request per mount.
+	clientMarkResolved string
 }
 
 // onTokenRefreshed keeps the driver storage in sync with the tokens issued by
@@ -34,8 +42,12 @@ func (d *Wopan) onTokenRefreshed(accessToken, refreshToken string) {
 }
 
 func (d *Wopan) setTokens(accessToken, refreshToken string) {
-	d.AccessToken = accessToken
-	d.RefreshToken = refreshToken
+	if accessToken != "" {
+		d.AccessToken = accessToken
+	}
+	if refreshToken != "" {
+		d.RefreshToken = refreshToken
+	}
 }
 
 func (d *Wopan) Config() driver.Config {
@@ -47,52 +59,203 @@ func (d *Wopan) GetAddition() driver.Additional {
 }
 
 func (d *Wopan) Init(ctx context.Context) error {
-	d.client = wopan.DefaultWithRefreshToken(d.RefreshToken)
+	d.client = wopansdk.DefaultWithRefreshToken(d.RefreshToken)
 	d.client.SetAccessToken(d.AccessToken)
+	d.client.SetPhone(d.Phone)
 	d.client.OnRefreshToken(d.onTokenRefreshed)
+	d.applyClientCredentials(d.preferredClientMark())
 	return d.initClient(ctx)
+}
+
+// preferredClientMark decides which client identity to try first.
+//
+//	explicit android/pc_web  -> that one
+//	built-in login (phone)   -> android, because the login itself is the app's
+//	pasted token             -> pc_web, the SDK's historical default
+func (d *Wopan) preferredClientMark() string {
+	switch d.ClientMark {
+	case "android", "pc_web":
+		return d.ClientMark
+	}
+	if d.usesBuiltinLogin() {
+		return "android"
+	}
+	return "pc_web"
+}
+
+func (d *Wopan) usesBuiltinLogin() bool {
+	return d.Phone != "" && (d.Password != "" || d.SmsCode != "")
+}
+
+// applyClientCredentials installs the credential pair, honouring the explicit
+// overrides first.
+func (d *Wopan) applyClientCredentials(mark string) {
+	clientID, clientSecret := wopansdk.DefaultClientID, wopansdk.DefaultClientSecret
+	switch mark {
+	case "android":
+		clientID, clientSecret = wopansdk.ClientIDAndroid, wopansdk.ClientSecretAndroid
+	case "pc_web":
+		clientID, clientSecret = wopansdk.ClientIDPCWeb, wopansdk.ClientSecretPCWeb
+	}
+	if d.ClientID != "" {
+		clientID = d.ClientID
+	}
+	if d.ClientSecret != "" {
+		clientSecret = d.ClientSecret
+	}
+	d.client.SetClientCredentials(clientID, clientSecret)
+	d.clientMarkResolved = mark
+}
+
+// alternateClientMark is the pair worth retrying when the first one is rejected.
+func alternateClientMark(mark string) string {
+	if mark == "android" {
+		return "pc_web"
+	}
+	return "android"
 }
 
 // initClient prepares the client before any dispatcher request is served.
 //
-// Two things have to happen here, in this order:
+// Three things happen here, in this order:
 //
 //  1. The browser User-Agent must be applied to the underlying resty client.
 //     The SDK only records it in WithUA/SetUA (and uses w.ua for upload2C), so
 //     dispatcher requests would otherwise be sent with resty's default
-//     "go-resty/..." UA, which the WoPan edge rejects with HTTP 403
-//     ("failed to list objs: request failed with status: 403 Forbidden").
-//  2. A missing or too short access token must be refreshed before the first
-//     request. Every wohome/api-user request body is AES encrypted with
-//     accessToken[:16]; with an empty token the SDK fails with
-//     "crypto/aes: invalid key size 0", which used to break refresh-token-only
-//     configurations during FamilyUserCurrentEncode.
+//     "go-resty/..." UA, which the WoPan edge rejects with HTTP 403.
+//  2. A usable token pair must exist: from the form, by refreshing, or by
+//     logging in with phone+password (AppLoginAccount) / phone+sms code.
+//  3. Optional data (family id, private-space psToken) is resolved.
 func (d *Wopan) initClient(ctx context.Context) error {
-	d.client.SetUserAgent(wopan.DefaultUA)
+	d.client.SetUserAgent(wopansdk.DefaultUA)
 
-	if len(d.AccessToken) < minAccessTokenLen {
-		if d.RefreshToken == "" {
-			return fmt.Errorf("an access token of at least %d characters or a refresh token is required", minAccessTokenLen)
-		}
-		if err := d.client.RefreshToken(); err != nil {
-			return fmt.Errorf("refresh access token: %w", err)
-		}
-		if accessToken, _ := d.client.GetToken(); len(accessToken) < minAccessTokenLen {
-			return errors.New("refresh access token: the server returned an invalid access token")
-		}
+	if err := d.ensureTokens(ctx); err != nil {
+		return err
 	}
-
 	if err := d.client.InitData(); err != nil {
 		return fmt.Errorf("initialize user data: %w", err)
 	}
-	fml, err := d.client.FamilyUserCurrentEncode(func(req *resty.Request) {
+
+	// The default family id is only an optimisation: an account without any
+	// family group answers 120002/10002/10004 here, and that must not stop the
+	// personal space from mounting.
+	if fml, err := d.client.FamilyUserCurrentEncode(func(req *resty.Request) {
+		req.SetContext(ctx)
+	}); err == nil {
+		d.defaultFamilyID = strconv.Itoa(fml.DefaultHomeId)
+	}
+
+	return d.initPrivateSpace(ctx)
+}
+
+// ensureTokens makes sure a usable access token is in memory.
+func (d *Wopan) ensureTokens(ctx context.Context) error {
+	if len(d.AccessToken) >= minAccessTokenLen {
+		return nil
+	}
+
+	switch {
+	case d.RefreshToken != "":
+		if err := d.refreshWithFallback(ctx); err != nil {
+			return fmt.Errorf("refresh access token: %w", err)
+		}
+	case d.usesBuiltinLogin():
+		if err := d.login(ctx); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("an access token of at least %d characters, a refresh token, or phone+password is required", minAccessTokenLen)
+	}
+
+	if accessToken, _ := d.client.GetToken(); len(accessToken) < minAccessTokenLen {
+		return errors.New("the server returned an invalid access token")
+	}
+	d.setTokens(d.client.GetToken())
+	return nil
+}
+
+// refreshWithFallback refreshes the token, retrying once with the other client
+// identity when the configured one is rejected. That is what makes a token
+// pasted from the Android app work without the user knowing about client ids.
+func (d *Wopan) refreshWithFallback(ctx context.Context) error {
+	err := d.client.RefreshToken()
+	if err == nil {
+		return nil
+	}
+	if d.ClientID != "" && d.ClientSecret != "" {
+		return err // the user pinned the pair explicitly, do not second-guess it
+	}
+	firstErr := err
+	alt := alternateClientMark(d.clientMarkResolved)
+	d.applyClientCredentials(alt)
+	if err := d.client.RefreshToken(); err != nil {
+		// Restore the pair the user asked for so the error message matches the
+		// configuration they see in the form.
+		d.applyClientCredentials(alternateClientMark(alt))
+		return fmt.Errorf("%w (also tried the %s client identity: %v)", firstErr, alt, err)
+	}
+	// The fallback worked: keep it, and persist the tokens.
+	op.MustSaveDriverStorage(d)
+	return nil
+}
+
+// login exchanges the configured phone number for a token pair, replicating the
+// Android app's AppLoginAccount / AppLoginByMobile.
+func (d *Wopan) login(ctx context.Context) error {
+	opt := func(req *resty.Request) { req.SetContext(ctx) }
+	clientID := d.client.ClientID()
+
+	if d.SmsCode != "" {
+		if _, err := d.client.AppLoginByMobile(d.Phone, d.SmsCode, d.Password, opt); err != nil {
+			return d.loginError(err, clientID)
+		}
+		return nil
+	}
+
+	if _, err := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt); err != nil {
+		// A refresh token/password mismatch can also mean "wrong client
+		// identity": retry once with the other pair before giving up.
+		if d.ClientID == "" && d.ClientSecret == "" {
+			alt := alternateClientMark(d.clientMarkResolved)
+			d.applyClientCredentials(alt)
+			if _, altErr := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt); altErr == nil {
+				return nil
+			}
+			d.applyClientCredentials(alternateClientMark(alt))
+		}
+		return d.loginError(err, clientID)
+	}
+	return nil
+}
+
+// loginError turns the SDK's signals into something a storage-form user can act
+// on: the captcha link, and the credential-pair hint.
+func (d *Wopan) loginError(err error, clientID string) error {
+	if errors.Is(err, wopansdk.ErrVerificationCodeRequired) {
+		return fmt.Errorf("联通云盘要求图形验证码：先用任意 uuid 打开 %s/api-user/getverifycode?uuid=<uuid> 看图"+
+			"（把 <uuid> 换成你自己生成的随机串），再把该串填进 verify_uuid、图上字符填进 verify_code，然后重新挂载。"+
+			"当前 clientId=%s", wopansdk.DefaultBaseURL, clientID)
+	}
+	return fmt.Errorf("login failed: %w (clientId=%s; if the password is correct, try switching client_mark)", err, clientID)
+}
+
+// initPrivateSpace resolves the psToken of the private space, which is not part
+// of any token pair: it comes from a separate password login.
+func (d *Wopan) initPrivateSpace(ctx context.Context) error {
+	spaceType := d.getSpaceType()
+	if spaceType != wopansdk.SpaceTypePrivate {
+		return nil
+	}
+	if d.PsToken != "" {
+		d.client.SetPsToken(d.PsToken)
+		return nil
+	}
+	if d.PrivatePwd == "" {
+		return errors.New("the private space needs private_space_password or ps_token")
+	}
+	return d.client.PrivateSpaceLogin(d.PrivatePwd, func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
-	if err != nil {
-		return fmt.Errorf("query default family: %w", err)
-	}
-	d.defaultFamilyID = strconv.Itoa(fml.DefaultHomeId)
-	return nil
 }
 
 func (d *Wopan) Drop(ctx context.Context) error {
@@ -101,10 +264,14 @@ func (d *Wopan) Drop(ctx context.Context) error {
 
 func (d *Wopan) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	var res []model.Obj
+	// The server pages from 0 (the app also sends pageNum "0" for the first
+	// page) and sortRule has to be forwarded or the sort_rule option does
+	// nothing at all.
 	pageNum := 0
 	pageSize := 100
+	sortRule := d.getSortRule()
 	for {
-		data, err := d.client.QueryAllFiles(d.getSpaceType(), dir.GetID(), pageNum, pageSize, 0, d.FamilyID, func(req *resty.Request) {
+		data, err := d.client.QueryAllFiles(d.getSpaceType(), dir.GetID(), pageNum, pageSize, sortRule, d.getFamilyID(), func(req *resty.Request) {
 			req.SetContext(ctx)
 		})
 		if err != nil {
@@ -124,26 +291,38 @@ func (d *Wopan) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([
 }
 
 func (d *Wopan) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if f, ok := file.(*Object); ok {
-		res, err := d.client.GetDownloadUrlV2([]string{f.FID}, func(req *resty.Request) {
-			req.SetContext(ctx)
-		})
-		if err != nil {
-			return nil, err
-		}
-		return &model.Link{
-			URL: res.List[0].DownloadUrl,
-		}, nil
+	f, ok := file.(*Object)
+	if !ok {
+		return nil, fmt.Errorf("unable to convert file to Object")
 	}
-	return nil, fmt.Errorf("unable to convert file to Object")
+	res, err := d.client.GetDownloadUrlV2([]string{f.FID}, func(req *resty.Request) {
+		req.SetContext(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(res.List) == 0 {
+		return nil, errors.New("empty download url list")
+	}
+	entry := res.List[0]
+	// entry.M3u8 (HLS playlist) and entry.VideoDuration are decoded by the SDK as
+	// well; the download URL stays the default here because Link is also used for
+	// saving the original file, and m3u8 is a transcoded stream.
+	return &model.Link{URL: entry.DownloadUrl}, nil
 }
 
 func (d *Wopan) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	familyID := d.FamilyID
-	if familyID == "" {
-		familyID = d.defaultFamilyID
+	// CreateDirectory only takes familyId when the target really is a family
+	// space; the app omits the field entirely otherwise
+	// (CreateDirectoryRequest.bodyObject checks isEmpty first). Passing the
+	// default family id together with spaceType=0 asks the server to create a
+	// folder in the family space the caller did not select.
+	spaceType := d.getSpaceType()
+	familyID := ""
+	if spaceType == wopansdk.SpaceTypeFamily {
+		familyID = d.getFamilyID()
 	}
-	_, err := d.client.CreateDirectory(d.getSpaceType(), parentDir.GetID(), dirName, familyID, func(req *resty.Request) {
+	_, err := d.client.CreateDirectory(spaceType, parentDir.GetID(), dirName, familyID, func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
 	return err
@@ -159,7 +338,7 @@ func (d *Wopan) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 	}
 	return d.client.MoveFile(dirList, fileList, dstDir.GetID(),
 		d.getSpaceType(), d.getSpaceType(),
-		d.FamilyID, d.FamilyID, func(req *resty.Request) {
+		d.getFamilyID(), d.getFamilyID(), func(req *resty.Request) {
 			req.SetContext(ctx)
 		})
 }
@@ -169,7 +348,7 @@ func (d *Wopan) Rename(ctx context.Context, srcObj model.Obj, newName string) er
 	if srcObj.IsDir() {
 		_type = 0
 	}
-	return d.client.RenameFileOrDirectory(d.getSpaceType(), _type, srcObj.GetID(), newName, d.FamilyID, func(req *resty.Request) {
+	return d.client.RenameFileOrDirectory(d.getSpaceType(), _type, srcObj.GetID(), newName, d.getFamilyID(), func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
 }
@@ -184,7 +363,7 @@ func (d *Wopan) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 	}
 	return d.client.CopyFile(dirList, fileList, dstDir.GetID(),
 		d.getSpaceType(), d.getSpaceType(),
-		d.FamilyID, d.FamilyID, func(req *resty.Request) {
+		d.getFamilyID(), d.getFamilyID(), func(req *resty.Request) {
 			req.SetContext(ctx)
 		})
 }
@@ -197,22 +376,23 @@ func (d *Wopan) Remove(ctx context.Context, obj model.Obj) error {
 	} else {
 		fileList = append(fileList, obj.GetID())
 	}
-	return d.client.DeleteFile(d.getSpaceType(), dirList, fileList, func(req *resty.Request) {
+	return d.client.DeleteFile(d.getSpaceType(), d.getVipLevel(ctx), dirList, fileList, func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
 }
 
 func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	_, err := d.client.Upload2C(d.getSpaceType(), wopan.Upload2CFile{
+	_, err := d.client.Upload2C(d.getSpaceType(), wopansdk.Upload2CFile{
 		Name:        stream.GetName(),
 		Size:        stream.GetSize(),
 		Content:     driver.NewLimitedUploadStream(ctx, stream),
 		ContentType: stream.GetMimetype(),
-	}, dstDir.GetID(), d.FamilyID, wopan.Upload2COption{
+	}, dstDir.GetID(), d.getFamilyID(), wopansdk.Upload2COption{
 		OnProgress: func(current, total int64) {
 			up(100 * float64(current) / float64(total))
 		},
-		Ctx: ctx,
+		Ctx:        ctx,
+		RetryTimes: upload2CRetryTimes,
 	})
 	return err
 }
@@ -226,6 +406,11 @@ func (d *Wopan) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
 	if err != nil {
 		return nil, err
 	}
+	// QueryCloudUsageInfo already carries the membership level; keep it so
+	// Remove does not have to fetch it again.
+	if quota.VipLevel != "" {
+		d.vipLevel = quota.VipLevel
+	}
 	return &model.StorageDetails{
 		DiskUsage: model.DiskUsage{
 			TotalSpace: total,
@@ -234,8 +419,5 @@ func (d *Wopan) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
 	}, nil
 }
 
-//func (d *Wopan) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
-//	return nil, errs.NotSupport
-//}
-
 var _ driver.Driver = (*Wopan)(nil)
+var _ driver.WithDetails = (*Wopan)(nil)
