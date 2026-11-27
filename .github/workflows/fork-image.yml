@@ -27,6 +27,11 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/openlist-wopan
   FRONTEND_VERSION: v4.2.10
   FRONTEND_REPO: OpenListTeam/OpenList-Frontend
+  # The wopan fork is replaced by tag from a personal repo, and a freshly pushed
+  # tag is not in sum.golang.org yet; without this go mod tidy fails on
+  # "verifying go.mod: 404 Not Found". Modules are still fetched through GOPROXY.
+  GOSUMDB: "off"
+  GOFLAGS: "-mod=mod"
 
 permissions:
   contents: read
