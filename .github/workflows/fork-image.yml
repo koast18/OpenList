@@ -83,8 +83,13 @@ jobs:
 
       - name: Vet wopan driver
         run: |
+          set -euo pipefail
           go vet ./drivers/wopan/
-          go test ./drivers/wopan/ -v 2>&1 | tail -40
+          go test ./drivers/wopan/ -v 2>&1 | tail -60
+          # `go test | tail` hides the exit status behind the pipeline, so the
+          # result is asserted explicitly: without this a failing test turned the
+          # whole job green.
+          go test ./drivers/wopan/
 
       - name: Build binary
         env:

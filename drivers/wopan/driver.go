@@ -195,8 +195,8 @@ func (d *Wopan) refreshWithFallback(ctx context.Context) error {
 		d.applyClientCredentials(alternateClientMark(alt))
 		return fmt.Errorf("%w (also tried the %s client identity: %v)", firstErr, alt, err)
 	}
-	// The fallback worked: keep it, and persist the tokens.
-	op.MustSaveDriverStorage(d)
+	// The fallback worked: keep it. The tokens are already persisted by the
+	// OnRefreshToken callback, which the SDK invokes after every refresh.
 	return nil
 }
 
