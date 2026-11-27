@@ -62,6 +62,25 @@ jobs:
           test -f public/dist/index.html
           echo "frontend files: $(find public/dist -type f | wc -l)"
 
+      - name: Tidy modules
+        run: |
+          set -euo pipefail
+          go mod tidy
+          echo '--- go.sum diff (fork module lines) ---'
+          git diff -U0 go.sum | grep -E 'wopan|^\+\+\+|^---' || true
+          echo '--- go.mod diff ---'
+          git diff go.mod || true
+
+      - name: Upload tidied module files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-mod-tidy
+          path: |
+            go.mod
+            go.sum
+          if-no-files-found: warn
+
       - name: Vet wopan driver
         run: |
           go vet ./drivers/wopan/
