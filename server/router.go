@@ -196,6 +196,9 @@ func admin(g *gin.RouterGroup) {
 	storage.POST("/enable", handles.EnableStorage)
 	storage.POST("/disable", handles.DisableStorage)
 	storage.POST("/load_all", handles.LoadAllStorages)
+	// Explicit "send one SMS code" action for drivers that need it (WoPan). It is a
+	// button in the storage form, never a side effect of saving.
+	storage.POST("/sms_code", handles.SendStorageSmsCode)
 
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)

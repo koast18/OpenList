@@ -28,7 +28,7 @@ type Addition struct {
 	AccessToken  string `json:"access_token" type:"text" help:"optional access token (>=16 chars); refreshed automatically when missing or too short"`
 	Phone        string `json:"phone" type:"text" help:"手机号：与 password 一起填即可自动登录换取 token"`
 	Password     string `json:"password" type:"text" help:"登录密码（AppLoginAccount）"`
-	SmsCode      string `json:"sms_code" type:"text" help:"短信验证码：与 phone 一起填则走 AppLoginByMobile（填了 password 则走双重认证）"`
+	SmsCode      string `json:"sms_code" type:"text" help:"短信验证码：与 phone 一起填则走 AppLoginByMobile（填了 password 则走双重认证）。验证码请点下面的「发送短信验证码」按钮获取"`
 	VerifyUUID   string `json:"verify_uuid" type:"text" help:"图形验证码 uuid，与 verify_code 必须成对填；见挂载报错里的链接"`
 	VerifyCode   string `json:"verify_code" type:"text" help:"图形验证码字符"`
 	ClientMark   string `json:"client_mark" type:"select" options:"auto,android,pc_web" default:"auto" help:"token 的签发方：android=联通云盘 App(1001000035)，pc_web=网页版(1001000021)，auto=按登录方式选并自动回退"`
@@ -44,8 +44,12 @@ type Addition struct {
 	SortRule string `json:"sort_rule" type:"select" options:"time_desc,name_asc,name_desc,time_asc" default:"time_desc" help:"服务端排序（无按大小排序）"`
 }
 
+// DriverName is the name the driver registers under; it is also what the
+// storage row stores in its `driver` column.
+const DriverName = "WoPan"
+
 var config = driver.Config{
-	Name:              "WoPan",
+	Name:              DriverName,
 	DefaultRoot:       "0",
 	NoOverwriteUpload: true,
 }

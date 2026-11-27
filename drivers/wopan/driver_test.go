@@ -24,6 +24,10 @@ type woPanMock struct {
 	calls     []string
 	refreshed int
 	badUA     int
+	smsSent   int
+	// smsGate makes AppLoginAccount answer {"needSmsCode":"1"} with no token,
+	// which is what an account that cannot log in with a password alone gets.
+	smsGate bool
 	// rejectRefreshes is how many AppRefreshToken calls answer "login failed"
 	// (RSP_CODE 8005) before one succeeds, which is how a wrong client
 	// identity looks from the outside.
@@ -40,6 +44,21 @@ func (m *woPanMock) transport(t *testing.T) http.RoundTripper {
 				Status:     "403 Forbidden",
 				Body:       io.NopCloser(strings.NewReader("forbidden")),
 				Header:     make(http.Header),
+				Request:    r,
+			}, nil
+		}
+
+		// sendMessageCodeBase is not a dispatcher call: it is a plain POST with
+		// {func, clientId, param} and no header envelope.
+		if strings.HasSuffix(r.URL.Path, "/api-user/sendMessageCodeBase") {
+			m.smsSent++
+			m.calls = append(m.calls, wopansdk.KeyAppSendMessageCode)
+			body := `{"STATUS":"200","MSG":"","RSP":{"RSP_CODE":"0000","RSP_DESC":"","DATA":null}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
 				Request:    r,
 			}, nil
 		}
@@ -69,7 +88,11 @@ func (m *woPanMock) transport(t *testing.T) http.RoundTripper {
 				data = `{"access_token":"fedcba9876543210","refresh_token":"new-refresh"}`
 			}
 		case wopansdk.KeyAppLoginAccount:
-			data = `{"access_token":"login-access-token","refresh_token":"login-refresh","phone":"13800000000"}`
+			if m.smsGate {
+				data = `{"needSmsCode":"1"}`
+			} else {
+				data = `{"access_token":"login-access-token","refresh_token":"login-refresh","phone":"13800000000"}`
+			}
 		case wopansdk.KeyAppQueryUser:
 			data = `{"userId":"test-user"}`
 		case wopansdk.KeyClassifyRule:
@@ -243,6 +266,51 @@ func TestInitClientBuiltinLogin(t *testing.T) {
 	}
 	if got := d.client.ClientID(); got != wopansdk.ClientIDAndroid {
 		t.Fatalf("clientId = %q, want %q", got, wopansdk.ClientIDAndroid)
+	}
+}
+
+// TestLoginNeverSendsSmsImplicitly is the regression test for the message spam:
+// a password login that stops at the SMS-code gate must never reach
+// sendMessageCodeBase, however often Init runs. Sending a code is a separate,
+// explicit action (SendSmsCode + the form button).
+func TestLoginNeverSendsSmsImplicitly(t *testing.T) {
+	mock := &woPanMock{smsGate: true}
+	d := &Wopan{Addition: Addition{Phone: "13800000000", Password: "secret"}}
+	newTestClient(d, mock.transport(t))
+
+	for i := 0; i < 3; i++ {
+		err := d.initClient(context.Background())
+		if err == nil {
+			t.Fatal("expected the SMS-code gate error, got nil")
+		}
+		if !strings.Contains(err.Error(), "发送短信验证码") {
+			t.Fatalf("error should point at the send button, got: %v", err)
+		}
+	}
+	if mock.smsSent != 0 {
+		t.Fatalf("sendMessageCodeBase was called %d time(s) during Init", mock.smsSent)
+	}
+}
+
+// TestSendSmsCodeIsExplicit checks the button action: exactly one request per
+// call, and it does not depend on Init having run.
+func TestSendSmsCodeIsExplicit(t *testing.T) {
+	mock := &woPanMock{smsGate: true}
+	d := &Wopan{Addition: Addition{Phone: "13800000000", Password: "secret"}}
+	newTestClient(d, mock.transport(t))
+
+	if err := d.SendSmsCode(context.Background()); err != nil {
+		t.Fatalf("SendSmsCode returned error: %v", err)
+	}
+	if mock.smsSent != 1 {
+		t.Fatalf("sendMessageCodeBase called %d time(s), want exactly 1", mock.smsSent)
+	}
+	// A second call is a second, separate user click.
+	if err := d.SendSmsCode(context.Background()); err != nil {
+		t.Fatalf("second SendSmsCode returned error: %v", err)
+	}
+	if mock.smsSent != 2 {
+		t.Fatalf("sendMessageCodeBase called %d time(s) after two clicks, want 2", mock.smsSent)
 	}
 }
 

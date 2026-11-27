@@ -129,7 +129,29 @@ func UpdateIndex() {
 		"<!-- customize body -->": customizeBody,
 	}
 	conf.IndexHtml = replaceStrings(conf.ManageHtml, replaceMap2)
+	// Pull in the WoPan storage-form helper. It is injected here rather than in
+	// Static() because this function runs again whenever a setting changes, and a
+	// one-shot injection would be lost on the next rebuild of these pages.
+	conf.ManageHtml = injectWopanForm(conf.ManageHtml)
+	conf.IndexHtml = injectWopanForm(conf.IndexHtml)
 	utils.Log.Debug("Index.html update completed")
+}
+
+// injectWopanForm appends the storage-form helper script tag, honouring the
+// site's base path so it also works when OpenList is mounted under a sub path.
+func injectWopanForm(html string) string {
+	src := "/wopan_form.js"
+	if basePath := getSiteConfig().BasePath; basePath != "" && basePath != "/" {
+		src = strings.TrimSuffix(basePath, "/") + src
+	}
+	tag := `<script src="` + src + `" defer></script>`
+	if strings.Contains(html, "wopan_form.js") {
+		return html
+	}
+	if idx := strings.LastIndex(html, "</body>"); idx >= 0 {
+		return html[:idx] + tag + html[idx:]
+	}
+	return html + tag
 }
 
 func manifestIcon(src string) ManifestIcon {
@@ -218,6 +240,15 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	}
 
 	utils.Log.Debug("Setting up catch-all route...")
+	// Serve the WoPan storage-form helper. The snippet adds the explicit "send SMS
+	// code" button, which cannot be a form control: OpenList has no button field
+	// type, and a code request on save would fire on every re-initialisation.
+	r.GET("/wopan_form.js", func(c *gin.Context) {
+		c.Header("Content-Type", "application/javascript; charset=utf-8")
+		c.Header("Cache-Control", "no-cache")
+		_, _ = c.Writer.Write(public.WoPanFormJS)
+	})
+
 	noRoute(func(c *gin.Context) {
 		if c.Request.Method != "GET" && c.Request.Method != "POST" {
 			c.Status(405)
