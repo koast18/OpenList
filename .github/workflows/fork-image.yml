@@ -28,9 +28,12 @@ env:
   FRONTEND_VERSION: v4.2.10
   FRONTEND_REPO: OpenListTeam/OpenList-Frontend
   # The wopan fork is replaced by tag from a personal repo, and a freshly pushed
-  # tag is not in sum.golang.org yet; without this go mod tidy fails on
-  # "verifying go.mod: 404 Not Found". Modules are still fetched through GOPROXY.
-  GOSUMDB: "off"
+  # tag is not in sum.golang.org yet, so it must bypass the checksum DB. This is
+  # scoped with GOPRIVATE/GONOSUMDB on purpose: GOSUMDB=off would also disable
+  # verification for the Go toolchain module itself, which then fails to
+  # download.
+  GOPRIVATE: github.com/koast18/*
+  GONOSUMDB: github.com/koast18/*
   GOFLAGS: "-mod=mod"
 
 permissions:
@@ -48,7 +51,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Pin the toolchain go.mod asks for: with a bare go-version-file the
+          # action installs `go` and then the toolchain switch downloads
+          # go1.27.3 at run time, which is an extra network dependency.
+          go-version: '1.27.3'
           cache: true
 
       - name: Fetch frontend dist
