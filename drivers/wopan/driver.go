@@ -202,6 +202,11 @@ func (d *Wopan) refreshWithFallback(ctx context.Context) error {
 
 // login exchanges the configured phone number for a token pair, replicating the
 // Android app's AppLoginAccount / AppLoginByMobile.
+//
+// When the account cannot log in with a password alone the server answers
+// {"needSmsCode":"1"} and no token; the driver then requests an SMS code itself
+// (POST /api-user/sendMessageCodeBase) and reports back, so the user only has to
+// paste the received code into sms_code and save again.
 func (d *Wopan) login(ctx context.Context) error {
 	opt := func(req *resty.Request) { req.SetContext(ctx) }
 	clientID := d.client.ClientID()
@@ -213,26 +218,55 @@ func (d *Wopan) login(ctx context.Context) error {
 		return nil
 	}
 
-	if _, err := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt); err != nil {
-		// A refresh token/password mismatch can also mean "wrong client
-		// identity": retry once with the other pair before giving up.
-		if d.ClientID == "" && d.ClientSecret == "" {
-			alt := alternateClientMark(d.clientMarkResolved)
-			d.applyClientCredentials(alt)
-			if _, altErr := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt); altErr == nil {
-				return nil
-			}
-			d.applyClientCredentials(alternateClientMark(alt))
-		}
-		return d.loginError(err, clientID)
+	_, err := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if errors.Is(err, wopansdk.ErrSmsCodeRequired) {
+		return d.requestSmsCode(ctx, opt)
+	}
+	// A rejected login can also mean "wrong client identity": retry once with the
+	// other pair before giving up.
+	if d.ClientID == "" && d.ClientSecret == "" {
+		alt := alternateClientMark(d.clientMarkResolved)
+		d.applyClientCredentials(alt)
+		_, altErr := d.client.AppLoginAccount(d.Phone, d.Password, d.VerifyUUID, d.VerifyCode, opt)
+		if altErr == nil {
+			return nil
+		}
+		if errors.Is(altErr, wopansdk.ErrSmsCodeRequired) {
+			return d.requestSmsCode(ctx, opt)
+		}
+		d.applyClientCredentials(alternateClientMark(alt))
+		err = altErr
+	}
+	return d.loginError(err, clientID)
+}
+
+// requestSmsCode asks the server to send an SMS login code and explains what to
+// do next. The request itself is what the app does before showing the code box.
+func (d *Wopan) requestSmsCode(ctx context.Context, opt wopansdk.RestyOption) error {
+	if d.Phone == "" {
+		return fmt.Errorf("这个账号需要短信验证码，但没有填手机号")
+	}
+	if err := d.client.SendMessageCode(d.Phone, 1, "app_send", opt); err != nil {
+		return fmt.Errorf("这个账号需要短信验证码，但发送验证码失败：%w（请稍后在联通云盘 App 里登录一次，把短信码填进 sms_code）", err)
+	}
+	return fmt.Errorf("这个账号不能只用密码登录，服务端要求短信验证码；"+
+		"已向 %s 发送验证码（clientId=%s）。把收到的验证码填进 sms_code 字段后重新保存即可。"+
+		"若没收到，等 60 秒后再保存一次以重发", d.Phone, d.client.ClientID())
 }
 
 // loginError turns the SDK's signals into something a storage-form user can act
-// on: the captcha link, and the credential-pair hint.
+// on: the SMS-code gate, the captcha link, and the credential-pair hint.
 func (d *Wopan) loginError(err error, clientID string) error {
-	if errors.Is(err, wopansdk.ErrVerificationCodeRequired) {
+	switch {
+	case errors.Is(err, wopansdk.ErrSmsCodeRequired):
+		return fmt.Errorf("这个账号不能只用密码登录，服务端要求短信验证码。"+
+			"请先在本机执行 `curl -s -m 5 http://192.168.2.167:5244/@manage/storages` 之外的任意方式获取验证码，"+
+			"或直接用联通云盘 App 登录一次后再把短信码填进 sms_code 字段并重新挂载"+
+			"（对应请求：AppLoginByMobile / AppLoginDoubleAuth，clientId=%s）", clientID)
+	case errors.Is(err, wopansdk.ErrVerificationCodeRequired):
 		return fmt.Errorf("联通云盘要求图形验证码：先用任意 uuid 打开 %s/api-user/getverifycode?uuid=<uuid> 看图"+
 			"（把 <uuid> 换成你自己生成的随机串），再把该串填进 verify_uuid、图上字符填进 verify_code，然后重新挂载。"+
 			"当前 clientId=%s", wopansdk.DefaultBaseURL, clientID)
