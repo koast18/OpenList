@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -382,10 +383,16 @@ func (d *Wopan) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+	// Prefer the seekable view of the stream: upload2C retries a part by
+	// rewinding, which only works when the source implements io.Seeker.
+	var src io.Reader = stream
+	if f := stream.GetFile(); f != nil {
+		src = f
+	}
 	_, err := d.client.Upload2C(d.getSpaceType(), wopansdk.Upload2CFile{
 		Name:        stream.GetName(),
 		Size:        stream.GetSize(),
-		Content:     driver.NewLimitedUploadStream(ctx, stream),
+		Content:     driver.NewLimitedUploadStream(ctx, src),
 		ContentType: stream.GetMimetype(),
 	}, dstDir.GetID(), d.getFamilyID(), wopansdk.Upload2COption{
 		OnProgress: func(current, total int64) {

@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -59,6 +60,17 @@ func (r *RateLimitReader) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+// Seek forwards to the wrapped reader when it is seekable. Without it the
+// rate-limited view of an upload stream loses the ability to rewind, and a
+// driver that retries a part (upload2C) can no longer recover from a transient
+// network error.
+func (r *RateLimitReader) Seek(offset int64, whence int) (int64, error) {
+	if s, ok := r.Reader.(io.Seeker); ok {
+		return s.Seek(offset, whence)
+	}
+	return 0, errors.New("stream is not seekable")
 }
 
 type RateLimitWriter struct {

@@ -1,4 +1,4 @@
-module github.com/OpenListTeam/OpenList/v4
+﻿module github.com/OpenListTeam/OpenList/v4
 
 go 1.26.4
 
@@ -339,5 +339,5 @@ replace github.com/cronokirby/saferith => github.com/Da3zKi7/saferith v0.33.0-fi
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260701021214-78760eaeafef
 
 // wopan-sdk-go fork: configurable client identity (Android app vs PC/Web) + app login.
-replace github.com/OpenListTeam/wopan-sdk-go => github.com/koast18/wopan-sdk-go v0.3.1
+replace github.com/OpenListTeam/wopan-sdk-go => github.com/koast18/wopan-sdk-go v0.3.2
 

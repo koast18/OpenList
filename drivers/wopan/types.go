@@ -1,6 +1,8 @@
 package wopandriver
 
 import (
+	"errors"
+
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	wopansdk "github.com/OpenListTeam/wopan-sdk-go"
 )
@@ -10,7 +12,10 @@ type Object struct {
 	FID string
 }
 
-func fileToObj(file wopansdk.File) (model.Obj, error) {
+func fileToObj(file *wopansdk.File) (model.Obj, error) {
+	if file == nil {
+		return nil, errors.New("nil file")
+	}
 	t, err := getTime(file.CreateTime)
 	if err != nil {
 		return nil, err
