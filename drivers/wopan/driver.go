@@ -109,9 +109,11 @@ func (d *Wopan) SendSmsCode(ctx context.Context) error {
 		client.SetAccessToken(d.AccessToken)
 		client.SetPhone(d.Phone)
 		client.SetClientCredentials(d.resolveCredentials())
-		// Same reason as in initClient: without the browser UA the edge answers 403.
-		client.SetUserAgent(wopansdk.DefaultUA)
 	}
+	// Always apply it: initClient documents that the edge answers 403 without a
+	// browser UA, and this action can be reached before Init has ever run (the
+	// admin endpoint builds a driver straight from the stored addition).
+	client.SetUserAgent(wopansdk.DefaultUA)
 	if err := client.SendMessageCode(d.Phone, 1, "app_send", func(req *resty.Request) {
 		req.SetContext(ctx)
 	}); err != nil {
