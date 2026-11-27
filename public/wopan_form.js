@@ -52,12 +52,13 @@
   }
 
   function flash(btn, message, ok) {
-    var old = btn.textContent;
+    // Restore the fixed label, not btn.textContent: by the time this runs the
+    // text is "发送中…", so capturing it would pin the button on that string.
     btn.textContent = message;
-    btn.disabled = true;
+    btn.disabled = false;
     btn.style.opacity = '0.75';
     setTimeout(function () {
-      btn.textContent = old;
+      btn.textContent = LABEL;
       btn.disabled = false;
       btn.style.opacity = '';
     }, ok ? 4000 : 6000);
